@@ -212,6 +212,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 	}
 	trace.Step("Running prefilter plugins done")
 
+	// 1、预选node
 	startPredicateEvalTime := time.Now()
 	filteredNodes, failedPredicateMap, filteredNodesStatuses, err := g.findNodesThatFit(ctx, state, pod)
 	if err != nil {
@@ -251,6 +252,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 		}, nil
 	}
 
+	// 2、优先算法
 	metaPrioritiesInterface := g.priorityMetaProducer(pod, filteredNodes, g.nodeInfoSnapshot)
 	priorityList, err := g.prioritizeNodes(ctx, state, pod, metaPrioritiesInterface, filteredNodes)
 	if err != nil {
@@ -262,6 +264,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 	metrics.SchedulingLatency.WithLabelValues(metrics.PriorityEvaluation).Observe(metrics.SinceInSeconds(startPriorityEvalTime))
 	metrics.DeprecatedSchedulingLatency.WithLabelValues(metrics.PriorityEvaluation).Observe(metrics.SinceInSeconds(startPriorityEvalTime))
 
+	// 3、调度
 	host, err := g.selectHost(priorityList)
 	trace.Step("Prioritizing done")
 
@@ -664,6 +667,12 @@ func (g *genericScheduler) podFitsOnNode(
 	// the nominated pods are treated as not running. We can't just assume the
 	// nominated pods are running because they are not running right now and in fact,
 	// they may end up getting scheduled to a different node.
+	//出于某些原因考虑我们需要运行两次predicate. 如果node上有更高或者相同优先级的“指定pods”（这里的“指定pods”指的是通过schedule计算后指定要跑在一个node上但是还未真正运行到那个node上的pods），我们将这些pods加入到meta和nodeInfo后执行一次计算过程。
+	//如果这个过程所有的predicates都成功了，我们再假设这些“指定pods”不会跑到node上再运行一次。第二次计算是必须的，因为有一些predicates比如pod亲和性，也许在“指定pods”没有成功跑到node的情况下会不满足。
+	//如果没有“指定pods”或者第一次计算过程失败了，那么第二次计算不会进行。
+	//我们在第一次调度的时候只考虑相等或者更高优先级的pods，因为这些pod是当前pod必须“臣服”的，也就是说不能够从这些pod中抢到资源，这些pod不会被当前pod“抢占”；这样当前pod也就能够安心从低优先级的pod手里抢资源了。
+	//新pod在上述2种情况下都可调度基于一个保守的假设：资源和pod反亲和性等的predicate在“指定pods”被处理为Running时更容易失败；pod亲和性在“指定pods”被处理为Not Running时更加容易失败。
+	//我们不能假设“指定pods”是Running的因为它们当前还没有运行，而且事实上，它们确实有可能最终又被调度到其他node上了。
 	for i := 0; i < 2; i++ {
 		metaToUse := meta
 		stateToUse := state
@@ -678,6 +687,7 @@ func (g *genericScheduler) podFitsOnNode(
 			break
 		}
 
+		// predicates.Ordering()得到的是一个[]string，predicate名字集合
 		for _, predicateKey := range predicates.Ordering() {
 			var (
 				fit     bool
@@ -685,7 +695,9 @@ func (g *genericScheduler) podFitsOnNode(
 				err     error
 			)
 
+			// 如果predicateFuncs有这个key，则调用这个predicate；也就是说predicateFuncs如果定义了一堆乱七八遭的名字，会被忽略调，因为predicateKey是内置的。
 			if predicate, exist := g.predicates[predicateKey]; exist {
+				// 真正调用predicate函数了！！！！！！！！！
 				fit, reasons, err = predicate(pod, metaToUse, nodeInfoToUse)
 				if err != nil {
 					return false, []predicates.PredicateFailureReason{}, nil, err
@@ -722,13 +734,16 @@ func (g *genericScheduler) podFitsOnNode(
 // All scores are finally combined (added) to get the total weighted scores of all nodes
 func (g *genericScheduler) prioritizeNodes(
 	ctx context.Context,
-	state *framework.CycleState,
-	pod *v1.Pod,
+	state *framework.CycleState, //调度周期状态，包含当前调度周期中的临时数据
+	pod *v1.Pod, // pod正在调度的 Pod。
 	meta interface{},
-	nodes []*v1.Node,
+	nodes []*v1.Node, // 可供选择的节点列表
 ) (framework.NodeScoreList, error) {
 	// If no priority configs are provided, then all nodes will have a score of one.
 	// This is required to generate the priority list in the required format
+	// 1、无评分插件情况处理：
+	// 首先检查是否没有配置任何评分插件 (g.prioritizers 为空且 g.extenders 为空且没有其他评分插件)。
+	// 如果没有评分插件，则所有节点的得分默认为 1，并返回结果。
 	if len(g.prioritizers) == 0 && len(g.extenders) == 0 && !g.framework.HasScorePlugins() {
 		result := make(framework.NodeScoreList, 0, len(nodes))
 		for i := range nodes {
@@ -740,11 +755,17 @@ func (g *genericScheduler) prioritizeNodes(
 		return result, nil
 	}
 
+	// 2、并发处理节点评分计算：
+	// 初始化并发控制相关的 sync.Mutex、sync.WaitGroup 和错误集合 errs。
+	// 使用 workqueue.ParallelizeUntil 并行处理节点列表，每个节点并发计算其在各个评分器下的得分。
+	// 每个评分器的结果存储在 results 数组中，每个元素是一个 framework.NodeScoreList，表示每个节点的评分结果。
+	// 这里只是简单定义3个变量，一把锁，一个并发等待相关的wg，一个错误集合errs；
 	var (
 		mu   = sync.Mutex{}
 		wg   = sync.WaitGroup{}
 		errs []error
 	)
+	// 这里定义了一个appendError小函数，逻辑很简单，并发场景下将错误信息收集到errs中；
 	appendError := func(err error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -769,6 +790,10 @@ func (g *genericScheduler) prioritizeNodes(
 		}
 	})
 
+	// 3、评分器 Reduce 操作：
+	//
+	//对每个评分器调用其 Reduce 方法，将之前计算的各个节点的评分结果进行汇总处理。
+	//使用并发 goroutine 处理 Reduce 操作，最后将每个评分器处理后的结果更新到 results 中。
 	for i := range g.prioritizers {
 		if g.prioritizers[i].Reduce == nil {
 			continue
@@ -796,19 +821,30 @@ func (g *genericScheduler) prioritizeNodes(
 		return framework.NodeScoreList{}, errors.NewAggregate(errs)
 	}
 
-	// Run the Score plugins.
+	// 4、Run the Score plugins.
+	// 运行评分插件：
+	//
+	//调用 g.framework.RunScorePlugins 方法，运行评分插件来获取额外的节点评分信息。
+	//将评分插件的得分合并到最终的评分结果中。
 	state.Write(migration.PrioritiesStateKey, &migration.PrioritiesStateData{Reference: meta})
 	scoresMap, scoreStatus := g.framework.RunScorePlugins(ctx, state, pod, nodes)
 	if !scoreStatus.IsSuccess() {
 		return framework.NodeScoreList{}, scoreStatus.AsError()
 	}
 
+	// 5、计算最终节点得分：
+	//
+	// 根据各个评分器和评分插件的得分，计算每个节点的最终得分，并将结果保存在 result 中。
 	// Summarize all scores.
+	// 这个result和前面的results类似，result用于存储每个node的Score，到这里已经没有必要区分算法了；
 	result := make(framework.NodeScoreList, 0, len(nodes))
 
 	for i := range nodes {
+		// 先在result中塞满所有node的Name，Score初始化为0
 		result = append(result, framework.NodeScore{Name: nodes[i].Name, Score: 0})
+		// 执行了多少个priorityConfig就有多少个Score，所以这里遍历len(priorityConfigs)次
 		for j := range g.prioritizers {
+			// 每个算法对应第i个node的结果分值加权后累加；
 			result[i].Score += results[j][i].Score * g.prioritizers[j].Weight
 		}
 
@@ -817,6 +853,10 @@ func (g *genericScheduler) prioritizeNodes(
 		}
 	}
 
+	// 6、处理 Extender 扩展插件：
+	//
+	//如果存在扩展插件 (g.extenders 不为空)，则对每个符合条件的扩展插件进行处理。
+	//扩展插件可能会返回额外的节点优先级，将其加权合并到节点的最终得分中。
 	if len(g.extenders) != 0 && nodes != nil {
 		combinedScores := make(map[string]int64, len(g.nodeInfoSnapshot.NodeInfoList))
 		for i := range g.extenders {
