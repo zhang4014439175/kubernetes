@@ -574,11 +574,15 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 				nodeInfo,
 				g.alwaysCheckAllPredicates,
 			)
+			//发送错误并取消上下文，停止进一步的检查
 			if err != nil {
 				errCh.SendErrorWithCancel(err, cancel)
 				return
 			}
 			if fits {
+				// 合适长度，大于AddInt32的话取消
+				// 如果适合的节点数量超过了 numNodesToFind，则取消上下文，停止进一步的检查。
+				// 否则，将节点添加到 filtered 列表中。
 				length := atomic.AddInt32(&filteredLen, 1)
 				if length > numNodesToFind {
 					cancel()
@@ -587,6 +591,9 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 					filtered[length-1] = nodeInfo.Node()
 				}
 			} else {
+				// 记录状态和失败原因：
+				//	•	如果 status 不是成功状态，将其记录到 filteredNodesStatuses 中。
+				//	•	如果 failedPredicates 不为空，将其记录到 failedPredicateMap 中。
 				predicateResultLock.Lock()
 				if !status.IsSuccess() {
 					filteredNodesStatuses[nodeInfo.Node().Name] = status
@@ -602,13 +609,20 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 		// are found.
 		// 并行节点检查
 		// workqueue。parallelelizeuntil:并行运行checkNode函数，直到上下文被取消或所有节点都被处理。
-		//processedNodes:已处理的节点总数。
-		//g.h nextstartnodeindex:更新下一个调度周期的索引。
+		// processedNodes:已处理的节点总数 = 适合调度的节点数量 + 过滤节点状态 + 失败的预选
+		//	•filteredLen：表示适合调度的节点数量。
+		//	•filteredNodesStatuses：包含所有不适合调度节点的状态信息的映射。
+		//	•failedPredicateMap：包含所有不适合调度节点的失败预选条件原因的映射。
+		// g.nextstartnodeindex:更新下一个调度周期的索引。
+		//  •上次开始调度节点索引 + 当前调度周期中处理的节点数 % allNodes，防止一直重复调度
 		workqueue.ParallelizeUntil(ctx, 16, allNodes, checkNode)
 		processedNodes := int(filteredLen) + len(filteredNodesStatuses) + len(failedPredicateMap)
 		g.nextStartNodeIndex = (g.nextStartNodeIndex + processedNodes) % allNodes
 
 		//filtered:将过滤后的节点切片为实际长度。
+		//通过将 filtered 切片到 filteredLen 的长度，可以得到一个实际适合调度的节点列表。
+		// 0 -> filteredLen
+		// 从错误通道中接收错误信息
 		filtered = filtered[:filteredLen]
 		if err := errCh.ReceiveError(); err != nil {
 			return []*v1.Node{}, FailedPredicateMap{}, framework.NodeToStatusMap{}, err
@@ -617,31 +631,40 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 
 	// 扩展过滤
 	// 扩展器:可以过滤节点的附加组件。
+	// filtered:适合的节点数
 	if len(filtered) > 0 && len(g.extenders) != 0 {
 		for _, extender := range g.extenders {
+			// 如果扩展器对当前 Pod 不感兴趣，跳过该扩展器。
 			if !extender.IsInterested(pod) {
 				continue
 			}
 			// filteredList, failedMap, err:扩展程序过滤的结果。
+			//	•调用扩展器的 Filter 方法，传入当前 Pod、过滤后的节点列表以及节点信息快照。
+			//	•该方法返回过滤后的节点列表（filteredList）、失败节点映射（failedMap）和错误（err）。
 			filteredList, failedMap, err := extender.Filter(pod, filtered, g.nodeInfoSnapshot.NodeInfoMap)
 			if err != nil {
+				// 如果扩展器返回错误且该错误可忽略，记录警告日志并跳过该扩展器。
 				if extender.IsIgnorable() {
 					klog.Warningf("Skipping extender %v as it returned error %v and has ignorable flag set",
 						extender, err)
 					continue
 				}
-
+				//如果错误不可忽略，返回空节点列表、空的失败预选条件映射和空的节点状态映射，并附带错误信息。
 				return []*v1.Node{}, FailedPredicateMap{}, framework.NodeToStatusMap{}, err
 			}
 
-			//failedPredicateMap:更新了来自扩展器的失败。
+			// failedPredicateMap:更新了来自扩展器的失败。
+			// 遍历扩展器返回的失败节点映射，将失败原因更新到 failedPredicateMap。
 			for failedNodeName, failedMsg := range failedMap {
 				if _, found := failedPredicateMap[failedNodeName]; !found {
 					failedPredicateMap[failedNodeName] = []predicates.PredicateFailureReason{}
 				}
 				failedPredicateMap[failedNodeName] = append(failedPredicateMap[failedNodeName], predicates.NewFailureReason(failedMsg))
 			}
+
 			//filtered:使用通过扩展程序过滤的节点进行更新。
+			//	•更新 filtered 为扩展器返回的过滤后的节点列表。
+			//	•如果过滤后的节点列表为空，停止进一步的扩展器过滤。
 			filtered = filteredList
 			if len(filtered) == 0 {
 				break
@@ -795,10 +818,17 @@ func (g *genericScheduler) podFitsOnNode(
 					return false, []predicates.PredicateFailureReason{}, nil, err
 				}
 
+				// 不合适，记录失败原因，
 				if !fit {
 					// eCache is available and valid, and predicates result is unfit, record the fail reasons
 					failedPredicates = append(failedPredicates, reasons...)
 					// if alwaysCheckAllPredicates is false, short circuit all predicates when one predicate fails.
+					// 	•	alwaysCheckAllPredicates = true：即使某个预选条件失败，调度器也会继续检查剩余的所有预选条件。这意味着调度器会收集所有可能的失败原因，
+					//		而不是在遇到第一个失败的条件时就停止检查。这种方式适用于需要全面了解所有可能的调度失败原因的场景，例如调试或详细分析调度失败的原因。
+					//	•	alwaysCheckAllPredicates = false：一旦某个预选条件失败，调度器会立即停止检查其他预选条件，并认为该节点不适合调度当前的 Pod。
+					//		这种方式可以节省资源和时间，因为不需要检查剩余的预选条件。
+					// 	•	alwaysCheckAllPredicates = true 适用于需要详细调试和分析调度失败原因的场景，特别是在开发和测试过程中。
+					//	•	alwaysCheckAllPredicates = false 适用于生产环境，尤其是在调度效率和资源利用率优先的场景下。
 					if !alwaysCheckAllPredicates {
 						klog.V(5).Infoln("since alwaysCheckAllPredicates has not been set, the predicate " +
 							"evaluation is short circuited and there are chances " +
@@ -809,6 +839,8 @@ func (g *genericScheduler) podFitsOnNode(
 			}
 		}
 
+		// factory文件中CreateFromKeys方法plugins.Append(pluginsForPredicates)添加插件
+		// todo 插件
 		status = g.framework.RunFilterPlugins(ctx, stateToUse, pod, nodeInfoToUse)
 		if !status.IsSuccess() && !status.IsUnschedulable() {
 			return false, failedPredicates, status, status.AsError()
