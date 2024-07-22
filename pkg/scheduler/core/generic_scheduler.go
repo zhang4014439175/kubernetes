@@ -196,6 +196,7 @@ func (g *genericScheduler) Schedule(ctx context.Context, state *framework.CycleS
 	}
 	trace.Step("Basic checks done")
 
+	// 获取node节点信息，方便findNodesThatFit里面使用
 	if err := g.Snapshot(); err != nil {
 		return result, err
 	}
@@ -328,6 +329,9 @@ func (g *genericScheduler) selectHost(nodeScoreList framework.NodeScoreList) (st
 // other pods with the same priority. The nominated pod prevents other pods from
 // using the nominated resources and the nominated pod could take a long time
 // before it is retried after many other pending pods.
+// Preempt 在 pod 调度发生失败的时候尝试抢占低优先级的 pod.
+// 返回发生 preemption 的 node, 被 preempt的 pods 列表,
+// nominated node name 需要被移除的 pods 列表，一个 error 信息.
 func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scheduleErr error) (*v1.Node, []*v1.Pod, []*v1.Pod, error) {
 	// Scheduler may return various types of errors. Consider preemption only if
 	// the error is of type FitError.
@@ -335,6 +339,9 @@ func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleSt
 	if !ok || fitError == nil {
 		return nil, nil, nil, nil
 	}
+	// 判断执行驱逐操作是否合适，如何判断是否适合抢占？
+	// 做的事情是判断一个 pod 是否应该去抢占其他 pods. 如果这个 pod 已经抢占过其他 pods，那些 pods 还在 graceful termination period 中，那就不应该再次发生抢占。
+	// 如果一个 node 已经被这个 pod nominated，并且这个 node 上有处于 terminating 状态的 pods，那么就不考虑驱逐更多的 pods.
 	if !podEligibleToPreemptOthers(pod, g.nodeInfoSnapshot.NodeInfoMap, g.enableNonPreempting) {
 		klog.V(5).Infof("Pod %v/%v is not eligible for more preemption.", pod.Namespace, pod.Name)
 		return nil, nil, nil, nil
@@ -342,6 +349,8 @@ func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleSt
 	if len(g.nodeInfoSnapshot.NodeInfoMap) == 0 {
 		return nil, nil, nil, ErrNoNodesAvailable
 	}
+	// 计算潜在的执行驱逐后能够用于跑 pod 的 nodes，怎么寻找能够用于 preempt 的 nodes？
+	// 要做的事情是寻找 predicates 阶段失败但是通过抢占也许能够调度成功的 nodes.
 	potentialNodes := nodesWherePreemptionMightHelp(g.nodeInfoSnapshot.NodeInfoMap, fitError)
 	if len(potentialNodes) == 0 {
 		klog.V(3).Infof("Preemption will not help schedule pod %v/%v on any node.", pod.Namespace, pod.Name)
@@ -352,12 +361,17 @@ func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleSt
 		pdbs []*policy.PodDisruptionBudget
 		err  error
 	)
+
+	// 列出 pdb 对象
 	if g.pdbLister != nil {
 		pdbs, err = g.pdbLister.List(labels.Everything())
 		if err != nil {
 			return nil, nil, nil, err
 		}
 	}
+
+	// 计算所有 node 需要驱逐的 pods 有哪些等，后面细讲，这个过程计算的是什么？
+	// 这个函数会并发计算所有的 nodes 是否通过驱逐实现 pod 抢占。
 	nodeToVictims, err := g.selectNodesForPreemption(ctx, state, pod, potentialNodes, pdbs)
 	if err != nil {
 		return nil, nil, nil, err
@@ -366,11 +380,19 @@ func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleSt
 	// We will only check nodeToVictims with extenders that support preemption.
 	// Extenders which do not support preemption may later prevent preemptor from being scheduled on the nominated
 	// node. In that case, scheduler will find a different host for the preemptor in subsequent scheduling cycles.
+	// 拓展调度的逻辑
 	nodeToVictims, err = g.processPreemptionWithExtenders(pod, nodeToVictims)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	// 选择1个 node 用于 schedule，怎么从选择最合适被抢占的 node？
+	//  要从给定的 nodes 中选择一个 node，这个函数假设给定的 map 中 value 部分是以 priority 降序排列的。这里选择 node 的标准是：
+	// 最少的 PDB violations
+	// 最少的高优先级 victim
+	// 优先级总数字最小
+	// victim 总数最小
+	// 直接返回第一个
 	candidateNode := pickOneNodeForPreemption(nodeToVictims)
 	if candidateNode == nil {
 		return nil, nil, nil, nil
@@ -380,6 +402,9 @@ func (g *genericScheduler) Preempt(ctx context.Context, state *framework.CycleSt
 	// this node. So, we should remove their nomination. Removing their
 	// nomination updates these pods and moves them to the active queue. It
 	// lets scheduler find another place for them.
+	// 低优先级的被 nominate 到这个 node 的 pod 很可能已经不再 fit 这个 node 了，所以
+	// 需要移除这些 pod 的 nomination，更新这些 pod，挪动到 activeQ 中，让调度器
+	// 得以寻找另外一个 node 给这些 pod
 	nominatedPods := g.getLowerPriorityNominatedPods(pod, candidateNode.Name)
 	if nodeInfo, ok := g.nodeInfoSnapshot.NodeInfoMap[candidateNode.Name]; ok {
 		return nodeInfo.Node(), nodeToVictims[candidateNode].Pods, nominatedPods, nil
@@ -482,9 +507,11 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 	failedPredicateMap := FailedPredicateMap{}
 	filteredNodesStatuses := framework.NodeToStatusMap{}
 
+	// 检查是否有谓词和过滤插件：
 	if len(g.predicates) == 0 && !g.framework.HasFilterPlugins() {
 		filtered = g.nodeInfoSnapshot.ListNodes()
 	} else {
+		// 定义需要找到的节点数量：
 		allNodes := len(g.nodeInfoSnapshot.NodeInfoList)
 		numNodesToFind := g.numFeasibleNodesToFind(int32(allNodes))
 
@@ -503,6 +530,7 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 		meta := g.predicateMetaProducer(pod, g.nodeInfoSnapshot)
 		state.Write(migration.PredicatesStateKey, &migration.PredicatesStateData{Reference: meta})
 
+		// 并行检查节点是否适合：
 		checkNode := func(i int) {
 			// We check the nodes starting from where we left off in the previous scheduling cycle,
 			// this is to make sure all nodes have the same chance of being examined across pods.
@@ -541,6 +569,7 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 
 		// Stops searching for more nodes once the configured number of feasible nodes
 		// are found.
+		// 定义一个 checkNode 函数，用于检查单个节点是否适合。并行地检查所有节点：
 		workqueue.ParallelizeUntil(ctx, 16, allNodes, checkNode)
 		processedNodes := int(filteredLen) + len(filteredNodesStatuses) + len(failedPredicateMap)
 		g.nextStartNodeIndex = (g.nextStartNodeIndex + processedNodes) % allNodes
@@ -551,6 +580,7 @@ func (g *genericScheduler) findNodesThatFit(ctx context.Context, state *framewor
 		}
 	}
 
+	// 调用扩展插件过滤节点：
 	if len(filtered) > 0 && len(g.extenders) != 0 {
 		for _, extender := range g.extenders {
 			if !extender.IsInterested(pod) {
@@ -918,9 +948,11 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 	if len(nodesToVictims) == 0 {
 		return nil
 	}
+	// 初始化为最大值
 	minNumPDBViolatingPods := int64(math.MaxInt32)
 	var minNodes1 []*v1.Node
 	lenNodes1 := 0
+	// 这个循环要找到 PDBViolatingPods 最少的 node，如果有多个，就全部存在 minNodes1 中
 	for node, victims := range nodesToVictims {
 		if len(victims.Pods) == 0 {
 			// We found a node that doesn't need any preemption. Return it!
@@ -940,15 +972,18 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 			lenNodes1++
 		}
 	}
+	// 如果只找到1个 PDB violations 最少的 node，那就直接返回这个 node 就 ok 了
 	if lenNodes1 == 1 {
 		return minNodes1[0]
 	}
 
 	// There are more than one node with minimum number PDB violating pods. Find
 	// the one with minimum highest priority victim.
+	// 还剩下多个 node，那就寻找 highest priority victim 最小的 node
 	minHighestPriority := int32(math.MaxInt32)
 	var minNodes2 = make([]*v1.Node, lenNodes1)
 	lenNodes2 := 0
+	// 这个循环要做的事情是看2个 node 上 victims 中最高优先级的 pod 哪个优先级更高
 	for i := 0; i < lenNodes1; i++ {
 		node := minNodes1[i]
 		victims := nodesToVictims[node]
@@ -963,12 +998,14 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 			lenNodes2++
 		}
 	}
+	// 发现只有1个，那就直接返回
 	if lenNodes2 == 1 {
 		return minNodes2[0]
 	}
 
 	// There are a few nodes with minimum highest priority victim. Find the
 	// smallest sum of priorities.
+	// 这时候还没有抉择出一个 node，那就开始计算优先级总和了，看哪个更低
 	minSumPriorities := int64(math.MaxInt64)
 	lenNodes1 = 0
 	for i := 0; i < lenNodes2; i++ {
@@ -979,6 +1016,8 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 			// needed so that a node with a few pods with negative priority is not
 			// picked over a node with a smaller number of pods with the same negative
 			// priority (and similar scenarios).
+			// 这里的累加考虑到了先把优先级搞成正数。不然会出现1个 node 上有1优先级为 -3 的 pod，
+			// 另外一个 node 上有2个优先级为 -3 的 pod，结果 -3>-6，有2个 pod 的 node 反而被认为总优先级更低！
 			sumPriorities += int64(podutil.GetPodPriority(pod)) + int64(math.MaxInt32+1)
 		}
 		if sumPriorities < minSumPriorities {
@@ -996,6 +1035,7 @@ func pickOneNodeForPreemption(nodesToVictims map[*v1.Node]*extenderv1.Victims) *
 
 	// There are a few nodes with minimum highest priority victim and sum of priorities.
 	// Find one with the minimum number of pods.
+	// 还是没有分出胜负，于是开始用 pod 总数做比较
 	minNumPods := math.MaxInt32
 	lenNodes2 = 0
 	for i := 0; i < lenNodes1; i++ {
@@ -1067,6 +1107,7 @@ func (g *genericScheduler) selectNodesForPreemption(
 		}
 		stateCopy := state.Clone()
 		stateCopy.Write(migration.PredicatesStateKey, &migration.PredicatesStateData{Reference: metaCopy})
+		// 这里有一个子过程调用，下面单独介绍
 		pods, numPDBViolations, fits := g.selectVictimsOnNode(ctx, stateCopy, pod, metaCopy, nodeInfoCopy, pdbs)
 		if fits {
 			resultLock.Lock()
@@ -1074,6 +1115,7 @@ func (g *genericScheduler) selectNodesForPreemption(
 				Pods:             pods,
 				NumPDBViolations: int64(numPDBViolations),
 			}
+			// 如果 fit，就添加到 nodeToVictims 中，也就是最后的返回值
 			nodeToVictims[potentialNodes[i]] = &victims
 			resultLock.Unlock()
 		}
@@ -1146,6 +1188,7 @@ func (g *genericScheduler) selectVictimsOnNode(
 ) ([]*v1.Pod, int, bool) {
 	var potentialVictims []*v1.Pod
 
+	// 定义删除 pod 函数
 	removePod := func(rp *v1.Pod) error {
 		if err := nodeInfo.RemovePod(rp); err != nil {
 			return err
@@ -1161,6 +1204,8 @@ func (g *genericScheduler) selectVictimsOnNode(
 		}
 		return nil
 	}
+
+	// 定义添加 pod 函数
 	addPod := func(ap *v1.Pod) error {
 		nodeInfo.AddPod(ap)
 		if meta != nil {
@@ -1176,6 +1221,7 @@ func (g *genericScheduler) selectVictimsOnNode(
 	}
 	// As the first step, remove all the lower priority pods from the node and
 	// check if the given pod can be scheduled.
+	// 删除所有的低优先级 pod 看是不是能够满足调度需求了
 	podPriority := podutil.GetPodPriority(pod)
 	for _, p := range nodeInfo.Pods() {
 		if podutil.GetPodPriority(p) < podPriority {
@@ -1185,12 +1231,16 @@ func (g *genericScheduler) selectVictimsOnNode(
 			}
 		}
 	}
+
 	// If the new pod does not fit after removing all the lower priority pods,
 	// we are almost done and this node is not suitable for preemption. The only
 	// condition that we could check is if the "pod" is failing to schedule due to
 	// inter-pod affinity to one or more victims, but we have decided not to
 	// support this case for performance reasons. Having affinity to lower
 	// priority pods is not a recommended configuration anyway.
+	// 如果删除了所有的低优先级 pods 之后还不能跑这个新 pod，那么差不多就可以判断这个 node 不适合 preemption 了，
+	// 还有一点点需要考虑的是这个“pod”的不 fit 的原因是由于 pod affinity 不满足了。 后续可能会增加当前 pod 和低优先级 pod 之间的 优先级检查。
+	// 这个函数调用其实就是之前讲到过的预选函数的调用逻辑，判断这个 pod 是否合适跑在这个 node 上。
 	if fits, _, _, err := g.podFitsOnNode(ctx, state, pod, meta, nodeInfo, false); !fits {
 		if err != nil {
 			klog.Warningf("Encountered error while selecting victims on node %v: %v", nodeInfo.Node().Name, err)
@@ -1204,7 +1254,12 @@ func (g *genericScheduler) selectVictimsOnNode(
 	// Try to reprieve as many pods as possible. We first try to reprieve the PDB
 	// violating victims and then other non-violating ones. In both cases, we start
 	// from the highest priority victims.
+	// 尝试尽量多地释放这些 pods，也就是说能少杀就少杀；
+	// 这里先从 PDB violating victims 中释放，再从 PDB non-violating victims 中释放；
+	// 两个组都是从高优先级的 pod 开始释放。
 	violatingVictims, nonViolatingVictims := filterPodsWithPDBViolation(potentialVictims, pdbs)
+
+	// 释放 pods 的函数，来一个放一个
 	reprievePod := func(p *v1.Pod) (bool, error) {
 		if err := addPod(p); err != nil {
 			return false, err
@@ -1219,6 +1274,8 @@ func (g *genericScheduler) selectVictimsOnNode(
 		}
 		return fits, nil
 	}
+
+	// 释放 violatingVictims 中元素的同时会记录放了多少个
 	for _, p := range violatingVictims {
 		if fits, err := reprievePod(p); err != nil {
 			klog.Warningf("Failed to reprieve pod %q: %v", p.Name, err)
@@ -1227,7 +1284,9 @@ func (g *genericScheduler) selectVictimsOnNode(
 			numViolatingVictim++
 		}
 	}
+
 	// Now we try to reprieve non-violating victims.
+	// 开始释放 non-violating victims.
 	for _, p := range nonViolatingVictims {
 		if _, err := reprievePod(p); err != nil {
 			klog.Warningf("Failed to reprieve pod %q: %v", p.Name, err)
@@ -1240,6 +1299,7 @@ func (g *genericScheduler) selectVictimsOnNode(
 // nodesWherePreemptionMightHelp returns a list of nodes with failed predicates
 // that may be satisfied by removing pods from the node.
 func nodesWherePreemptionMightHelp(nodeNameToInfo map[string]*schedulernodeinfo.NodeInfo, fitErr *FitError) []*v1.Node {
+	// 潜力 node， 用于存储返回值的 slice
 	potentialNodes := []*v1.Node{}
 	for name, node := range nodeNameToInfo {
 		if fitErr.FilteredNodesStatuses[name].Code() == framework.UnschedulableAndUnresolvable {
@@ -1273,9 +1333,11 @@ func podEligibleToPreemptOthers(pod *v1.Pod, nodeNameToInfo map[string]*schedule
 	}
 	nomNodeName := pod.Status.NominatedNodeName
 	if len(nomNodeName) > 0 {
+		// 被 nominate 的 node
 		if nodeInfo, found := nodeNameToInfo[nomNodeName]; found {
 			podPriority := podutil.GetPodPriority(pod)
 			for _, p := range nodeInfo.Pods() {
+				// 有低优先级的 pod 处于删除中状态，就返回 false
 				if p.DeletionTimestamp != nil && podutil.GetPodPriority(p) < podPriority {
 					// There is a terminating pod on the nominated node.
 					return false

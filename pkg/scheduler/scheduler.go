@@ -445,13 +445,32 @@ func (sched *Scheduler) recordSchedulingFailure(podInfo *framework.PodInfo, err 
 // preempt tries to create room for a pod that has failed to schedule, by preempting lower priority pods if possible.
 // If it succeeds, it adds the name of the node where preemption has happened to the pod spec.
 // It returns the node name and an error if any.
+
+// Preempt 寻找一个在发生抢占之后能够成功调度“pod”的node.
+//
+//	这个 node 信息
+//	被抢占的 pods 信息
+//	nominated node name 需要被清理的 node 列表
+//	可能有的 error
+//
+// Preempt 过程不涉及快照更新（快照的逻辑以后再讲）
+// 避免出现这种情况：preempt 发现一个不需要驱逐任何 pods 就能够跑“pod”的 node.
+// 当有很多 pending pods 在调度队列中的时候，a nominated pod 会排到队列中相同优先级的 pod 后面.
+// The nominated pod 会阻止其他 pods 使用“指定”的资源，哪怕花费了很多时间来等待其他 pending 的 pod.
 func (sched *Scheduler) preempt(ctx context.Context, state *framework.CycleState, fwk framework.Framework, preemptor *v1.Pod, scheduleErr error) (string, error) {
+	// 特性没有开启就返回 ""，13版本的
+	//if !util.PodPriorityEnabled() || sched.config.DisablePreemption {
+	//	return "", nil
+	//}
+
+	// 更新 pod 信息；入参和返回值都是 *v1.Pod 类型
 	preemptor, err := sched.podPreemptor.getUpdatedPod(preemptor)
 	if err != nil {
 		klog.Errorf("Error getting the updated preemptor pod object: %v", err)
 		return "", err
 	}
 
+	// preempt 过程，下文分析
 	node, victims, nominatedPodsToClear, err := sched.Algorithm.Preempt(ctx, state, preemptor, scheduleErr)
 	if err != nil {
 		klog.Errorf("Error preempting victims to make room for %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
@@ -463,9 +482,11 @@ func (sched *Scheduler) preempt(ctx context.Context, state *framework.CycleState
 		// Update the scheduling queue with the nominated pod information. Without
 		// this, there would be a race condition between the next scheduling cycle
 		// and the time the scheduler receives a Pod Update for the nominated pod.
+		// 更新队列中“任命pod”队列
 		sched.SchedulingQueue.UpdateNominatedPodForNode(preemptor, nodeName)
 
 		// Make a call to update nominated node name of the pod on the API server.
+		// 设置pod的Status.NominatedNodeName
 		err = sched.podPreemptor.setNominatedNodeName(preemptor, nodeName)
 		if err != nil {
 			klog.Errorf("Error in preemption process. Cannot set 'NominatedPod' on pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
@@ -474,6 +495,7 @@ func (sched *Scheduler) preempt(ctx context.Context, state *framework.CycleState
 		}
 
 		for _, victim := range victims {
+			// 将要驱逐的 pod 驱逐
 			if err := sched.podPreemptor.deletePod(victim); err != nil {
 				klog.Errorf("Error preempting pod %v/%v: %v", victim.Namespace, victim.Name, err)
 				return "", err
@@ -492,6 +514,8 @@ func (sched *Scheduler) preempt(ctx context.Context, state *framework.CycleState
 	// but preemption logic does not find any node for it. In that case Preempt()
 	// function of generic_scheduler.go returns the pod itself for removal of
 	// the 'NominatedPod' field.
+	// Clearing nominated pods should happen outside of "if node != nil".
+	// 这个清理过程在上面的if外部，我们回头从 Preempt() 的实现去理解
 	for _, p := range nominatedPodsToClear {
 		rErr := sched.podPreemptor.removeNominatedNodeName(p)
 		if rErr != nil {
@@ -782,14 +806,17 @@ type podPreemptorImpl struct {
 	Client clientset.Interface
 }
 
+// 新获取一次 pod 的信息
 func (p *podPreemptorImpl) getUpdatedPod(pod *v1.Pod) (*v1.Pod, error) {
 	return p.Client.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
 }
 
+// 删除一个 pod
 func (p *podPreemptorImpl) deletePod(pod *v1.Pod) error {
 	return p.Client.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
 }
 
+// 设置pod.Status.NominatedNodeName 为指定的 node name
 func (p *podPreemptorImpl) setNominatedNodeName(pod *v1.Pod, nominatedNodeName string) error {
 	podCopy := pod.DeepCopy()
 	podCopy.Status.NominatedNodeName = nominatedNodeName
@@ -797,6 +824,7 @@ func (p *podPreemptorImpl) setNominatedNodeName(pod *v1.Pod, nominatedNodeName s
 	return err
 }
 
+// 清空 pod.Status.NominatedNodeName
 func (p *podPreemptorImpl) removeNominatedNodeName(pod *v1.Pod) error {
 	if len(pod.Status.NominatedNodeName) == 0 {
 		return nil

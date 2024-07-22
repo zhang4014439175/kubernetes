@@ -127,6 +127,7 @@ type PriorityQueue struct {
 
 	// activeQ is heap structure that scheduler actively looks at to find pods to
 	// schedule. Head of heap is the highest priority pod.
+	// heap 头节点存的是最高优先级的 pod
 	activeQ *heap.Heap
 	// podBackoffQ is a heap ordered by backoff expiry. Pods which have completed backoff
 	// are popped from this heap before the scheduler looks at activeQ
@@ -135,6 +136,7 @@ type PriorityQueue struct {
 	unschedulableQ *UnschedulablePodsMap
 	// nominatedPods is a structures that stores pods which are nominated to run
 	// on nodes.
+	// 存储已经被指定好要跑在某个 node 的 pod
 	nominatedPods *nominatedPodMap
 	// schedulingCycle represents sequence number of scheduling cycle and is incremented
 	// when a pod is popped.
@@ -144,6 +146,9 @@ type PriorityQueue struct {
 	// cycle will be put back to activeQueue if we were trying to schedule them
 	// when we received move request.
 	moveRequestCycle int64
+
+	// 只要将 pod 从 unschedulableQ 移动到 activeQ，就设置为true；从 activeQ 中 pop 出来 pod的时候设置为 false. 这个字段表明一个 pod 在被调度的过程中是否接收到了队列 move 操作，如果发生了 move 操作，那么这个 pod 就算被认定为 unschedulable，也被放回到 activeQ.
+	// receivedMoveRequest bool
 
 	// closed indicates that the queue is closed.
 	// It is mainly used to let Pop() exit its control loop while waiting for an item.
@@ -259,10 +264,12 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	pInfo := p.newPodInfo(pod)
+	// 直接在 activeQ 中添加 pod
 	if err := p.activeQ.Add(pInfo); err != nil {
 		klog.Errorf("Error adding pod %v/%v to the scheduling queue: %v", pod.Namespace, pod.Name, err)
 		return err
 	}
+	// 如果在 unschedulableQ 中找到这个 pod，抛错误日志后移除队列中该 pod
 	if p.unschedulableQ.get(pod) != nil {
 		klog.Errorf("Error: pod %v/%v is already in the unschedulable queue.", pod.Namespace, pod.Name)
 		p.unschedulableQ.delete(pod)
@@ -272,6 +279,7 @@ func (p *PriorityQueue) Add(pod *v1.Pod) error {
 		klog.Errorf("Error: pod %v/%v is already in the podBackoff queue.", pod.Namespace, pod.Name)
 	}
 	metrics.SchedulerQueueIncomingPods.WithLabelValues("active", PodAdd).Inc()
+	// 队列的 nominatedPods 属性中标记该 pod 不指定到任何 node
 	p.nominatedPods.add(pod, "")
 	p.cond.Broadcast()
 
@@ -324,15 +332,18 @@ func (p *PriorityQueue) SchedulingCycle() int64 {
 // the queue, unless it is already in the queue. Normally, PriorityQueue puts
 // unschedulable pods in `unschedulableQ`. But if there has been a recent move
 // request, then the pod is put in `podBackoffQ`.
+// 如果2个队列中都不存在该 pod，那么就添加到 active queue 中
 func (p *PriorityQueue) AddUnschedulableIfNotPresent(pInfo *framework.PodInfo, podSchedulingCycle int64) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	pod := pInfo.Pod
+	//如果队列 unschedulableQ 中有 pod，啥也不做
 	if p.unschedulableQ.get(pod) != nil {
 		return fmt.Errorf("pod is already present in unschedulableQ")
 	}
 
 	// Refresh the timestamp since the pod is re-added.
+	//如果队列 activeQ 中有 pod，啥也不做
 	pInfo.Timestamp = p.clock.Now()
 	if _, exists, _ := p.activeQ.Get(pInfo); exists {
 		return fmt.Errorf("pod is already present in the activeQ")
@@ -346,6 +357,7 @@ func (p *PriorityQueue) AddUnschedulableIfNotPresent(pInfo *framework.PodInfo, p
 
 	// If a move request has been received, move it to the BackoffQ, otherwise move
 	// it to unschedulableQ.
+	// podBackoffQ 应该是相当于 activeQ
 	if p.moveRequestCycle >= podSchedulingCycle {
 		if err := p.podBackoffQ.Add(pInfo); err != nil {
 			return fmt.Errorf("error adding pod %v to the backoff queue: %v", pod.Name, err)
@@ -397,20 +409,24 @@ func (p *PriorityQueue) flushBackoffQCompleted() {
 
 // flushUnschedulableQLeftover moves pod which stays in unschedulableQ longer than the durationStayUnschedulableQ
 // to activeQ.
+// 刷新 unschedulableQ 中的 pod，如果一个 pod 的呆的时间超过了 durationStayUnschedulableQ，就移动到 activeQ 中
 func (p *PriorityQueue) flushUnschedulableQLeftover() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
 	var podsToMove []*framework.PodInfo
 	currentTime := p.clock.Now()
+	// 遍历 unschedulableQ 中的 pod
 	for _, pInfo := range p.unschedulableQ.podInfoMap {
 		lastScheduleTime := pInfo.Timestamp
+		// 这里的默认值是 60s，所以超过 60s 的 pod 将得到进入 activeQ 的机会
 		if currentTime.Sub(lastScheduleTime) > unschedulableQTimeInterval {
 			podsToMove = append(podsToMove, pInfo)
 		}
 	}
 
 	if len(podsToMove) > 0 {
+		// 全部移到 activeQ 中，又有机会被调度了
 		p.movePodsToActiveOrBackoffQueue(podsToMove, UnschedulableTimeout)
 	}
 }
@@ -418,10 +434,12 @@ func (p *PriorityQueue) flushUnschedulableQLeftover() {
 // Pop removes the head of the active queue and returns it. It blocks if the
 // activeQ is empty and waits until a new item is added to the queue. It
 // increments scheduling cycle when a pod is popped.
+// 从 activeQ 中 pop 一个 pod
 func (p *PriorityQueue) Pop() (*framework.PodInfo, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	for p.activeQ.Len() == 0 {
+		// 当队列为空的时候会阻塞
 		// When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
 		// When Close() is called, the p.closed is set and the condition is broadcast,
 		// which causes this loop to continue and return from the Pop().
@@ -437,6 +455,8 @@ func (p *PriorityQueue) Pop() (*framework.PodInfo, error) {
 	pInfo := obj.(*framework.PodInfo)
 	pInfo.Attempts++
 	p.schedulingCycle++
+	// 标记 receivedMoveRequest 为 false，表示新的一次调度开始了
+	// p.receivedMoveRequest = false
 	return pInfo, err
 }
 
@@ -651,6 +671,7 @@ func (p *PriorityQueue) DeleteNominatedPodIfExists(pod *v1.Pod) {
 // This is called during the preemption process after a node is nominated to run
 // the pod. We update the structure before sending a request to update the pod
 // object to avoid races with the following scheduling cycles.
+// pod 抢占的时候，确定一个 node 可以用于跑这个 pod 时，通过调用这个方法将 pod nominated 到 指定的 node 上。
 func (p *PriorityQueue) UpdateNominatedPodForNode(pod *v1.Pod, nodeName string) {
 	p.lock.Lock()
 	p.nominatedPods.add(pod, nodeName)
@@ -761,15 +782,20 @@ type nominatedPodMap struct {
 func (npm *nominatedPodMap) add(p *v1.Pod, nodeName string) {
 	// always delete the pod if it already exist, to ensure we never store more than
 	// one instance of the pod.
+	// 不管有没有，先删一下，防止重了
 	npm.delete(p)
 
 	nnn := nodeName
+	// 如果传入的 nodeName 是 “”
 	if len(nnn) == 0 {
+		// 查询 pod 的 pod.Status.NominatedNodeName
 		nnn = NominatedNodeName(p)
+		// 如果 pod.Status.NominatedNodeName 也是 “”,return
 		if len(nnn) == 0 {
 			return
 		}
 	}
+	// 逻辑到这里说明要么 nodeName 不为空字符串，要么 nodeName 为空字符串但是 pod 的 pod.Status.NominatedNodeName 不为空字符串，这时候开始下面的赋值
 	npm.nominatedPodToNode[p.UID] = nnn
 	for _, np := range npm.nominatedPods[nnn] {
 		if np.UID == p.UID {
